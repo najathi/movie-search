@@ -58,30 +58,73 @@ function uniqueLinks(links: LinkResult[]): LinkResult[] {
   return result;
 }
 
-function extractLinks(html: string, baseUrl: string): LinkResult[] {
+const MAX_PAGES_ABSOLUTE_LIMIT = 50; // Safety cap
+
+function extractLinks(html: string, baseUrl: string, query: string): LinkResult[] {
   const $ = load(html);
   const links: LinkResult[] = [];
   const baseOrigin = new URL(baseUrl).origin.toLowerCase();
+  const normalizedQuery = query.toLowerCase().trim();
+  const queryWords = normalizedQuery.split(/\s+/);
 
-  $("a").each((_: number, element: Element) => {
+  // User specified structure for movies: <div class="f"> <a href="..."> ... </a> </div>
+  $("div.f a").each((_: number, element: Element) => {
     const href = $(element).attr("href");
     const text = $(element).text().trim();
-    if (!href) return;
+    if (!href || !text) return;
 
     const url = normalizeUrl(baseUrl, href);
     if (!url) return;
 
-    const lower = url.toLowerCase();
-    if (!lower.startsWith(baseOrigin)) return;
-    if (!text) return;
+    const lowerUrl = url.toLowerCase();
 
-    links.push({ title: text, url });
+    // Strict filter: Must be from the same origin
+    if (!lowerUrl.startsWith(baseOrigin)) return;
+
+    // Strict filter: Movie pages end in '-movie/' or '-web-series/' but NOT '-movies/'
+    // Example valid: /dhandoraa-2025-tamil-movie/
+    // Example invalid: /tamil-2025-movies/
+    if (lowerUrl.includes("-movies/")) return;
+
+    // Often valid movie links have specific patterns, but exclusion is safer.
+    // If it doesn't have "-movie/" or "-series/", it might be a category or junk.
+    // Let's rely on the negative filter for category pages mainly.
+    if (!lowerUrl.includes("-movie/") && !lowerUrl.includes("-series/")) return;
+
+    const lowerText = text.toLowerCase();
+
+    // Check if text or URL contains the query
+    const matchText = queryWords.every(w => lowerText.includes(w));
+    const matchUrl = queryWords.every(w => lowerUrl.includes(w));
+
+    if (matchText || matchUrl) {
+      links.push({ title: text, url });
+    }
   });
 
   return uniqueLinks(links);
 }
 
-async function trySearch(url: string): Promise<string | null> {
+// Helper to find max pages from HTML
+function detectMaxPages(html: string): number {
+  const $ = load(html);
+  let maxPage = 1;
+  // Look for pagination links ?page=N or /page/N/
+  $("a").each((_, el) => {
+    const href = $(el).attr("href");
+    if (!href) return;
+
+    // Match ?page=123
+    const matchQuery = href.match(/[?&]page=(\d+)/);
+    if (matchQuery) {
+      const p = parseInt(matchQuery[1], 10);
+      if (!isNaN(p) && p > maxPage) maxPage = p;
+    }
+  });
+  return maxPage;
+}
+
+async function fetchPage(url: string): Promise<string | null> {
   const response = await fetchWithTimeout(url, 10000);
   if (!response.ok) return null;
   const text = await response.text();
@@ -89,38 +132,74 @@ async function trySearch(url: string): Promise<string | null> {
   return text;
 }
 
+const YEAR_RANGE = 7; // Look back 7 years
+
 async function searchMovieLinks(params: SearchParams): Promise<LinkResult[]> {
   const baseUrl = params.baseUrl;
   const query = params.query.trim();
   const maxResults = params.maxResults ?? 10;
 
-  const candidates = [
-    `${baseUrl}/search/${encodeURIComponent(query)}`,
-    `${baseUrl}/?s=${encodeURIComponent(query)}`,
-    `${baseUrl}/search?search=${encodeURIComponent(query)}`,
-    `${baseUrl}/search?query=${encodeURIComponent(query)}`
-  ];
+  const currentYear = new Date().getFullYear();
 
-  let html: string | null = null;
-  for (const url of candidates) {
-    try {
-      html = await trySearch(url);
-    } catch {
-      html = null;
-    }
-    if (html) break;
+  // We will scan year pages. For each year, we scan ALL pages.
+  const yearsToScan: number[] = [currentYear + 1];
+  for (let i = 0; i < YEAR_RANGE; i++) {
+    yearsToScan.push(currentYear - i);
   }
 
-  if (!html) return [];
+  let allLinks: LinkResult[] = [];
 
-  const links = extractLinks(html, baseUrl)
-    .filter((link) => {
-      const lower = link.url.toLowerCase();
-      return lower.includes("/movie") || lower.includes("/movies") || lower.includes("/movie-") || lower.includes("/tamil");
-    })
-    .slice(0, maxResults);
+  // We should scan years sequentially to find recent stuff first?
+  // But to find "earliest release" we might need to scan all years?
+  // User wants specific movie. So valid movie could be anywhere.
 
-  return links;
+  // Process years in parallel usually fine, but page scanning is heavy.
+  // Let's optimize: Scan years, detect max pages, then batch fetch.
+
+  for (const year of yearsToScan) {
+    // 1. Fetch Page 1
+    const page1Url = `${baseUrl}/tamil-${year}-movies/`;
+    const html1 = await fetchPage(page1Url).catch(() => null);
+
+    if (!html1) continue;
+
+    // Extract from Page 1
+    const links1 = extractLinks(html1, baseUrl, query);
+    allLinks = allLinks.concat(links1);
+
+    // Detect Max Pages
+    let maxPages = detectMaxPages(html1);
+    if (maxPages > MAX_PAGES_ABSOLUTE_LIMIT) maxPages = MAX_PAGES_ABSOLUTE_LIMIT;
+
+    if (maxPages > 1) {
+      const pageUrls: string[] = [];
+      for (let p = 2; p <= maxPages; p++) {
+        pageUrls.push(`${baseUrl}/tamil-${year}-movies/?page=${p}`);
+      }
+
+      // Fetch remaining pages in batches
+      const BATCH_SIZE = 10;
+      for (let i = 0; i < pageUrls.length; i += BATCH_SIZE) {
+        const batch = pageUrls.slice(i, i + BATCH_SIZE);
+        const results = await Promise.all(
+          batch.map(async (url) => {
+            const h = await fetchPage(url).catch(() => null);
+            if (!h) return [];
+            return extractLinks(h, baseUrl, query);
+          })
+        );
+        for (const l of results) allLinks = allLinks.concat(l);
+      }
+    }
+
+    // Optimization: if we have enough results and matching perfect query?
+    // But query might be obscure. Let's trying scanning.
+  }
+
+  // De-duplicate global results
+  allLinks = uniqueLinks(allLinks);
+
+  return allLinks.slice(0, maxResults);
 }
 
 const server = new McpServer(
@@ -142,25 +221,25 @@ server.registerTool(
     inputSchema: SearchInput
   },
   async (params: SearchParams) => {
-  const results = await searchMovieLinks(params);
-  return {
-    content: [
-      {
-        type: "text",
-        text: JSON.stringify(
-          {
-            query: params.query,
-            baseUrl: params.baseUrl,
-            count: results.length,
-            results
-          },
-          null,
-          2
-        )
-      }
-    ]
-  };
-});
+    const results = await searchMovieLinks(params);
+    return {
+      content: [
+        {
+          type: "text",
+          text: JSON.stringify(
+            {
+              query: params.query,
+              baseUrl: params.baseUrl,
+              count: results.length,
+              results
+            },
+            null,
+            2
+          )
+        }
+      ]
+    };
+  });
 
 const transport = new StdioServerTransport();
 await server.connect(transport);

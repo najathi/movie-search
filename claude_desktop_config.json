@@ -1,0 +1,10 @@
+{
+  "mcpServers": {
+    "search-film": {
+      "command": "node",
+      "args": [
+        "...../movie-search/dist/index.js"
+      ]
+    }
+  }
+}

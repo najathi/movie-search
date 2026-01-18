@@ -1,0 +1,26 @@
+{
+  "name": "isaimini3-mcp",
+  "version": "0.1.0",
+  "description": "MCP server to search Isaamini3 and return movie links",
+  "type": "module",
+  "private": true,
+  "main": "dist/index.js",
+  "bin": {
+    "isaimini3-mcp": "dist/index.js"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "start": "node dist/index.js",
+    "dev": "tsc -p tsconfig.json --watch",
+    "inspector": "DANGEROUSLY_OMIT_AUTH=true ./node_modules/.bin/mcp-inspector node dist/index.js"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.0.0",
+    "cheerio": "^1.0.0-rc.12",
+    "zod": "^3.23.8"
+  },
+  "devDependencies": {
+    "@modelcontextprotocol/inspector": "^0.6.0",
+    "typescript": "^5.5.4"
+  }
+}
